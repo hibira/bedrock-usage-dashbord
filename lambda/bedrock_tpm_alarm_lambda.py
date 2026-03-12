@@ -229,6 +229,7 @@ def _build_metric_widget(metric_name, stat, unit_label, key, profiles, quota, x,
         title += f" (quota: {quota:,.0f})"
         raw_metrics = []
         expr_parts = []
+        hide_individual = len(profiles) >= 5
         for i, (pid, info) in enumerate(profiles):
             mid = f"raw{i}"
             expr_parts.append(mid)
@@ -240,6 +241,7 @@ def _build_metric_widget(metric_name, stat, unit_label, key, profiles, quota, x,
                 "expression": f"{mid}/{quota}*100",
                 "label": f"{info['profile_name']} (%)",
                 "id": f"pct{i}",
+                "visible": not hide_individual,
             }])
         raw_metrics.append([{
             "expression": f"({'+'.join(expr_parts)})/{quota}*100",
@@ -272,6 +274,7 @@ def _build_metric_widget(metric_name, stat, unit_label, key, profiles, quota, x,
                 "metrics": raw_metrics,
                 "view": "timeSeries", "region": REGION,
                 "title": title, "period": 60,
+                "yAxis": {"left": {"min": 0}},
             },
         }
 
