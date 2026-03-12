@@ -40,9 +40,11 @@ def get_inference_profiles():
                 model_arn = p.get("models", [{}])[0].get("modelArn", "unknown")
                 model_name = model_arn.rsplit("/", 1)[-1] if "/" in model_arn else model_arn
                 name = p.get("inferenceProfileName", "")
-                # Determine quota scope
-                is_global = pid.startswith("global.")
-                is_1m = "1m" in pid.lower() or "1M" in name or "1m" in model_name.lower()
+                # Global: system profile starting with "global." OR
+                #         application profile whose model ARN has no region
+                #         (arn:aws:bedrock:::foundation-model/...)
+                is_global = pid.startswith("global.") or ":bedrock:::" in model_arn
+                is_1m = "1m" in pid.lower() or "1m" in name.lower() or "1m" in model_name.lower()
                 if is_global and is_1m:
                     quota_type = "global-1m"
                 elif is_global:
