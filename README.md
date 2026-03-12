@@ -15,9 +15,10 @@ The burndown rate is 5× for Claude 3.7+ models (1× for others). Alarm threshol
 - Fetches both SYSTEM_DEFINED and APPLICATION inference profiles
 - Groups profiles by (model, quota type) — Global and Regional quotas are monitored separately
 - Creates CloudWatch Alarms for both TPM and RPM with thresholds based on actual Service Quotas
-- Builds a CloudWatch Dashboard showing TPM and RPM usage as % of quota via metric math
+- Builds a per-region CloudWatch Dashboard showing TPM and RPM usage as % of quota via metric math
 - Cleans up stale alarms for removed profiles/models
 - Supports filtering to monitor only specific models
+- Supports multi-region deployment with per-region SNS topics
 - Runs daily at 0:00 UTC (9:00 JST) via EventBridge
 
 ## Quota Grouping
@@ -36,13 +37,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Monitor specific models only
+# Single-region deploy
 npx cdk deploy \
   -c sns_topic_arn=arn:aws:sns:us-east-1:123456789012:your-topic \
   -c model_filter="claude-sonnet-4-6,claude-sonnet-4-5,claude-opus-4-5,claude-opus-4-6"
 
-# Monitor all models (omit model_filter)
-npx cdk deploy -c sns_topic_arn=arn:aws:sns:us-east-1:123456789012:your-topic
+# Multi-region deploy (per-region SNS topics)
+npx cdk deploy --all \
+  -c sns_topic_arns="us-east-1=arn:aws:sns:us-east-1:123456789012:topic1,us-west-2=arn:aws:sns:us-west-2:123456789012:topic2" \
+  -c model_filter="claude-sonnet-4-6,claude-sonnet-4-5,claude-opus-4-5,claude-opus-4-6"
 ```
 
 ## Lambda Environment Variables
@@ -52,15 +55,18 @@ npx cdk deploy -c sns_topic_arn=arn:aws:sns:us-east-1:123456789012:your-topic
 | `SNS_TOPIC_ARN` | SNS topic ARN for alarm notifications | (required) |
 | `THRESHOLD_PERCENT` | Alarm threshold as % of quota | `80` |
 | `REGION` | AWS region | `us-east-1` |
-| `DASHBOARD_NAME` | CloudWatch Dashboard name | `Bedrock-Quota-Usage` |
+| `DASHBOARD_NAME` | CloudWatch Dashboard name | `Bedrock-Quota-Usage-{REGION}` |
 | `MODEL_FILTER` | Comma-separated model name patterns (partial match). Empty = all models | `""` |
 
 ## CDK Context Parameters
 
 | Parameter | Description |
 |-----------|-------------|
-| `sns_topic_arn` | SNS topic ARN for alarm notifications (required) |
+| `sns_topic_arn` | SNS topic ARN for single-region deploy |
+| `sns_topic_arns` | Multi-region deploy: `region=arn` pairs, comma-separated |
 | `model_filter` | Comma-separated model name patterns (optional) |
+
+> Either `sns_topic_arn` or `sns_topic_arns` is required.
 
 ## How It Works
 

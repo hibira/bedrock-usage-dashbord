@@ -18,7 +18,7 @@ SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 THRESHOLD_PERCENT = float(os.environ.get("THRESHOLD_PERCENT", "80"))
 ALARM_PREFIX_TPM = "Bedrock-TPM-"
 ALARM_PREFIX_RPM = "Bedrock-RPM-"
-DASHBOARD_NAME = os.environ.get("DASHBOARD_NAME", "Bedrock-Quota-Usage")
+DASHBOARD_NAME = os.environ.get("DASHBOARD_NAME", f"Bedrock-Quota-Usage-{REGION}")
 MODEL_FILTER = [p.strip() for p in os.environ.get("MODEL_FILTER", "").split(",") if p.strip()]
 
 bedrock = boto3.client("bedrock", region_name=REGION)
