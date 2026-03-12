@@ -133,21 +133,40 @@ def _matches_filter(model_name):
     return any(p.lower() in name_lower for p in MODEL_FILTER)
 
 
+def _group_key(info):
+    """Return grouping key: (model_name, profile_type).
+    Quotas differ between global cross-region and geo cross-region."""
+    return (info["model_name"], info["profile_type"])
+
+
 def group_by_model(profiles):
-    """Group active profiles by their underlying model name, applying MODEL_FILTER."""
+    """Group active profiles by (model_name, profile_type), applying MODEL_FILTER."""
     by_model = defaultdict(list)
     for pid, info in profiles.items():
         if info.get("status") == "ACTIVE" and _matches_filter(info["model_name"]):
-            by_model[info["model_name"]].append((pid, info))
+            by_model[_group_key(info)].append((pid, info))
     return by_model
 
 
-def put_model_alarm(model_name, profile_entries, quota_value):
+def _display_name(key):
+    """Human-readable label for a (model_name, profile_type) key."""
+    model_name, profile_type = key
+    prefix = {"global": "Global", "cross-region": "CrossRegion", "on-demand": "OnDemand"}
+    return f"{model_name} [{prefix.get(profile_type, profile_type)}]"
+
+
+def _alarm_suffix(key):
+    """Alarm name suffix for a (model_name, profile_type) key."""
+    model_name, profile_type = key
+    safe = model_name.replace(".", "-").replace(":", "-")
+    return f"{safe}--{profile_type}"
+
+
+def put_model_alarm(key, profile_entries, quota_value):
     """Create/update a CloudWatch Alarm using metric math.
     Threshold is set to quota_value * THRESHOLD_PERCENT / 100."""
-    safe_name = model_name.replace(".", "-").replace(":", "-")
-    alarm_name = f"{ALARM_PREFIX}{safe_name}"
-
+    alarm_name = f"{ALARM_PREFIX}{_alarm_suffix(key)}"
+    display = _display_name(key)
     threshold = quota_value * THRESHOLD_PERCENT / 100
 
     metrics = []
@@ -176,7 +195,7 @@ def put_model_alarm(model_name, profile_entries, quota_value):
         metrics.append({
             "Id": "total",
             "Expression": "+".join(metric_ids),
-            "Label": f"{model_name} Total TPM",
+            "Label": f"{display} Total TPM",
             "ReturnData": True,
         })
 
@@ -184,7 +203,7 @@ def put_model_alarm(model_name, profile_entries, quota_value):
     cw.put_metric_alarm(
         AlarmName=alarm_name,
         AlarmDescription=(
-            f"Bedrock TPM monitor: {model_name} | "
+            f"Bedrock TPM monitor: {display} | "
             f"quota: {quota_value:,.0f} TPM, threshold: {threshold:,.0f} TPM ({THRESHOLD_PERCENT}%) | "
             f"profiles: {profile_names}"
         ),
@@ -197,7 +216,7 @@ def put_model_alarm(model_name, profile_entries, quota_value):
         OKActions=[SNS_TOPIC_ARN],
         Tags=[
             {"Key": "ManagedBy", "Value": "bedrock-tpm-alarm-lambda"},
-            {"Key": "ModelName", "Value": model_name},
+            {"Key": "ModelName", "Value": key[0]},
             {"Key": "QuotaTPM", "Value": str(int(quota_value))},
         ],
     )
@@ -231,14 +250,15 @@ def build_dashboard(by_model, model_quotas):
     })
     y += 1
 
-    for model_name, profiles in sorted(by_model.items()):
-        quota = model_quotas.get(model_name)
+    for key, profiles in sorted(by_model.items(), key=lambda x: _display_name(x[0])):
+        display = _display_name(key)
+        quota = model_quotas.get(key)
         quota_label = f" (quota: {quota:,.0f} TPM)" if quota else " (quota: unknown)"
 
         widgets.append({
             "type": "text",
             "x": 0, "y": y, "width": 24, "height": 1,
-            "properties": {"markdown": f"## {model_name}{quota_label}"},
+            "properties": {"markdown": f"## {display}{quota_label}"},
         })
         y += 1
 
@@ -287,7 +307,7 @@ def build_dashboard(by_model, model_quotas):
                     "metrics": raw_metrics,
                     "view": "timeSeries",
                     "region": REGION,
-                    "title": f"{model_name} - TPM Quota Usage (%)",
+                    "title": f"{display} - TPM Quota Usage (%)",
                     "period": 60,
                     "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
                     "annotations": {
@@ -314,7 +334,7 @@ def build_dashboard(by_model, model_quotas):
                     "metrics": raw_metrics,
                     "view": "timeSeries",
                     "region": REGION,
-                    "title": f"{model_name} - TPM (raw, quota unknown)",
+                    "title": f"{display} - TPM (raw, quota unknown)",
                     "period": 60,
                 },
             })
@@ -336,27 +356,27 @@ def handler(event, context):
     by_model = group_by_model(profiles)
     print(f"Grouped into {len(by_model)} models")
 
-    # Resolve quota for each model
+    # Resolve quota for each model group
     model_quotas = {}
-    for model_name, entries in by_model.items():
-        profile_type = entries[0][1]["profile_type"]
+    for key, entries in by_model.items():
+        model_name, profile_type = key
         quota_value = match_quota(model_name, profile_type, quotas)
         if quota_value:
-            model_quotas[model_name] = quota_value
+            model_quotas[key] = quota_value
 
-    print(f"Matched quotas for {len(model_quotas)}/{len(by_model)} models")
+    print(f"Matched quotas for {len(model_quotas)}/{len(by_model)} groups")
 
     created = []
     skipped = []
-    for model_name, entries in by_model.items():
-        quota = model_quotas.get(model_name)
+    for key, entries in by_model.items():
+        quota = model_quotas.get(key)
         if quota:
-            name = put_model_alarm(model_name, entries, quota)
+            name = put_model_alarm(key, entries, quota)
             created.append(name)
             print(f"Upserted alarm: {name} (quota: {quota:,.0f}, threshold: {quota * THRESHOLD_PERCENT / 100:,.0f})")
         else:
-            skipped.append(model_name)
-            print(f"Skipped (no quota found): {model_name}")
+            skipped.append(_display_name(key))
+            print(f"Skipped (no quota found): {_display_name(key)}")
 
     deleted = cleanup_stale_alarms(set(created))
     if deleted:
@@ -370,6 +390,6 @@ def handler(event, context):
         "deleted_alarms": len(deleted),
         "skipped_no_quota": skipped,
         "dashboard": DASHBOARD_NAME,
-        "models_with_quota": len(model_quotas),
-        "models_total": len(by_model),
+        "groups_with_quota": len(model_quotas),
+        "groups_total": len(by_model),
     }
