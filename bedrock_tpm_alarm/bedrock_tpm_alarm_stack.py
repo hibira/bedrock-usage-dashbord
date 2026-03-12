@@ -37,7 +37,10 @@ class BedrockTpmAlarmStack(Stack):
         )
 
         fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["bedrock:ListInferenceProfiles"],
+            actions=[
+                "bedrock:ListInferenceProfiles",
+                "servicequotas:ListServiceQuotas",
+            ],
             resources=["*"],
         ))
         fn.add_to_role_policy(iam.PolicyStatement(
