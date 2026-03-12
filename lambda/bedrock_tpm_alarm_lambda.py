@@ -17,6 +17,8 @@ SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 THRESHOLD_PERCENT = float(os.environ.get("THRESHOLD_PERCENT", "80"))
 ALARM_PREFIX = "Bedrock-TPM-"
 DASHBOARD_NAME = os.environ.get("DASHBOARD_NAME", "Bedrock-TPM-Usage")
+# Comma-separated model name patterns (partial match). Empty = all models.
+MODEL_FILTER = [p.strip() for p in os.environ.get("MODEL_FILTER", "").split(",") if p.strip()]
 
 bedrock = boto3.client("bedrock", region_name=REGION)
 cw = boto3.client("cloudwatch", region_name=REGION)
@@ -123,11 +125,19 @@ def match_quota(model_name, profile_type, quotas):
     return best_match["value"] if best_match and best_score >= 2 else None
 
 
+def _matches_filter(model_name):
+    """Check if model name matches any pattern in MODEL_FILTER."""
+    if not MODEL_FILTER:
+        return True
+    name_lower = model_name.lower()
+    return any(p.lower() in name_lower for p in MODEL_FILTER)
+
+
 def group_by_model(profiles):
-    """Group active profiles by their underlying model name."""
+    """Group active profiles by their underlying model name, applying MODEL_FILTER."""
     by_model = defaultdict(list)
     for pid, info in profiles.items():
-        if info.get("status") == "ACTIVE":
+        if info.get("status") == "ACTIVE" and _matches_filter(info["model_name"]):
             by_model[info["model_name"]].append((pid, info))
     return by_model
 

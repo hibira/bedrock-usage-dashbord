@@ -18,7 +18,7 @@ from constructs import Construct
 
 
 class BedrockTpmAlarmStack(Stack):
-    def __init__(self, scope: Construct, id: str, *, sns_topic_arn: str, **kwargs):
+    def __init__(self, scope: Construct, id: str, *, sns_topic_arn: str, model_filter: str = "", **kwargs):
         super().__init__(scope, id, **kwargs)
 
         topic = sns.Topic.from_topic_arn(self, "ExistingTopic", sns_topic_arn)
@@ -33,6 +33,7 @@ class BedrockTpmAlarmStack(Stack):
                 "SNS_TOPIC_ARN": sns_topic_arn,
                 "THRESHOLD_PERCENT": "80",
                 "REGION": self.region,
+                "MODEL_FILTER": model_filter,
             },
         )
 
