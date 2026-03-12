@@ -44,15 +44,7 @@ def get_inference_profiles():
                 #         application profile whose model ARN has no region
                 #         (arn:aws:bedrock:::foundation-model/...)
                 is_global = pid.startswith("global.") or ":bedrock:::" in model_arn
-                is_1m = "1m" in pid.lower() or "1m" in name.lower() or "1m" in model_name.lower()
-                if is_global and is_1m:
-                    quota_type = "global-1m"
-                elif is_global:
-                    quota_type = "global"
-                elif is_1m:
-                    quota_type = "regional-1m"
-                else:
-                    quota_type = "regional"
+                quota_type = "global" if is_global else "regional"
                 profiles[pid] = {
                     "model_name": model_name,
                     "profile_name": name or pid,
@@ -90,23 +82,19 @@ def _normalize(s):
 
 def match_quota(model_name, quota_type, quotas):
     """Find the best matching TPM quota for a model + quota_type.
-    quota_type: global/global-1m/regional/regional-1m
+    quota_type: 'global' or 'regional'
     """
     model_keywords = _normalize(model_name.replace(".", " ").replace("-", " "))
-    is_1m = quota_type.endswith("-1m")
-    is_global = quota_type.startswith("global")
-    prefix = "global cross-region" if is_global else "cross-region"
+    prefix = "global cross-region" if quota_type == "global" else "cross-region"
 
     best_match = None
     best_score = 0
     for qname_lower, qinfo in quotas.items():
         if prefix not in qname_lower:
             continue
-        if not is_global and "global" in qname_lower:
+        if quota_type == "regional" and "global" in qname_lower:
             continue
-        # 1M context matching
-        has_1m = "1m context" in qname_lower
-        if is_1m != has_1m:
+        if "1m context" in qname_lower:
             continue
 
         q_normalized = _normalize(qinfo["name"])
@@ -135,13 +123,8 @@ def _group_key(info):
 
 def _display_name(key):
     model_name, quota_type = key
-    labels = {
-        "global": "Global",
-        "global-1m": "Global 1M",
-        "regional": "Regional",
-        "regional-1m": "Regional 1M",
-    }
-    return f"{model_name} [{labels.get(quota_type, quota_type)}]"
+    label = "Global" if quota_type == "global" else "Regional"
+    return f"{model_name} [{label}]"
 
 
 def _alarm_suffix(key):
