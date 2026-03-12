@@ -1,7 +1,7 @@
 """
 Auto-create/update CloudWatch Alarms and Dashboard for Bedrock inference profile
-EstimatedTPMQuotaUsage metrics. Alarms and dashboard graphs are grouped by
-(model_name, quota_type) where quota_type is 'global' or 'regional'.
+TPM (EstimatedTPMQuotaUsage) and RPM (Invocations Sum) metrics.
+Alarms and dashboard are grouped by (model, quota_type: global/regional).
 Thresholds are derived from actual Service Quotas. Runs daily via EventBridge.
 """
 
@@ -16,9 +16,9 @@ import boto3
 REGION = os.environ.get("REGION", "us-east-1")
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 THRESHOLD_PERCENT = float(os.environ.get("THRESHOLD_PERCENT", "80"))
-ALARM_PREFIX = "Bedrock-TPM-"
-DASHBOARD_NAME = os.environ.get("DASHBOARD_NAME", "Bedrock-TPM-Usage")
-# Comma-separated model name patterns (partial match). Empty = all models.
+ALARM_PREFIX_TPM = "Bedrock-TPM-"
+ALARM_PREFIX_RPM = "Bedrock-RPM-"
+DASHBOARD_NAME = os.environ.get("DASHBOARD_NAME", "Bedrock-Quota-Usage")
 MODEL_FILTER = [p.strip() for p in os.environ.get("MODEL_FILTER", "").split(",") if p.strip()]
 
 bedrock = boto3.client("bedrock", region_name=REGION)
@@ -31,7 +31,6 @@ sq = boto3.client("service-quotas", region_name=REGION)
 # ---------------------------------------------------------------------------
 
 def get_inference_profiles():
-    """Fetch both SYSTEM_DEFINED and APPLICATION inference profiles."""
     profiles = {}
     paginator = bedrock.get_paginator("list_inference_profiles")
     for ptype in ("SYSTEM_DEFINED", "APPLICATION"):
@@ -40,17 +39,12 @@ def get_inference_profiles():
                 pid = p["inferenceProfileId"]
                 model_arn = p.get("models", [{}])[0].get("modelArn", "unknown")
                 model_name = model_arn.rsplit("/", 1)[-1] if "/" in model_arn else model_arn
-                name = p.get("inferenceProfileName", "")
-                # Global: system profile starting with "global." OR
-                #         application profile whose model ARN has no region
-                #         (arn:aws:bedrock:::foundation-model/...)
                 is_global = pid.startswith("global.") or ":bedrock:::" in model_arn
-                quota_type = "global" if is_global else "regional"
                 profiles[pid] = {
                     "model_name": model_name,
-                    "profile_name": name or pid,
+                    "profile_name": p.get("inferenceProfileName", "") or pid,
                     "status": p.get("status"),
-                    "quota_type": quota_type,
+                    "quota_type": "global" if is_global else "regional",
                 }
     return profiles
 
@@ -59,20 +53,19 @@ def get_inference_profiles():
 # Service Quotas
 # ---------------------------------------------------------------------------
 
-def get_tpm_quotas():
-    """Fetch all Bedrock TPM quotas from Service Quotas."""
-    quotas = {}
+def get_quotas():
+    """Fetch TPM and RPM quotas. Returns (tpm_quotas, rpm_quotas) dicts."""
+    tpm, rpm = {}, {}
     paginator = sq.get_paginator("list_service_quotas")
     for page in paginator.paginate(ServiceCode="bedrock"):
         for q in page["Quotas"]:
-            name = q["QuotaName"]
-            if "tokens per minute" in name.lower():
-                quotas[name.lower()] = {
-                    "code": q["QuotaCode"],
-                    "value": q["Value"],
-                    "name": name,
-                }
-    return quotas
+            name = q["QuotaName"].lower()
+            entry = {"code": q["QuotaCode"], "value": q["Value"], "name": q["QuotaName"]}
+            if "tokens per minute" in name:
+                tpm[name] = entry
+            elif "requests per minute" in name:
+                rpm[name] = entry
+    return tpm, rpm
 
 
 def _normalize(s):
@@ -82,14 +75,9 @@ def _normalize(s):
 
 
 def match_quota(model_name, quota_type, quotas):
-    """Find the best matching TPM quota for a model + quota_type.
-    quota_type: 'global' or 'regional'
-    """
     model_keywords = _normalize(model_name.replace(".", " ").replace("-", " "))
     prefix = "global cross-region" if quota_type == "global" else "cross-region"
-
-    best_match = None
-    best_score = 0
+    best_match, best_score = None, 0
     for qname_lower, qinfo in quotas.items():
         if prefix not in qname_lower:
             continue
@@ -97,13 +85,10 @@ def match_quota(model_name, quota_type, quotas):
             continue
         if "1m context" in qname_lower:
             continue
-
-        q_normalized = _normalize(qinfo["name"])
-        score = sum(1 for w in model_keywords.split() if w in q_normalized)
+        score = sum(1 for w in model_keywords.split() if w in _normalize(qinfo["name"]))
         if score > best_score:
             best_score = score
             best_match = qinfo
-
     return best_match["value"] if best_match and best_score >= 2 else None
 
 
@@ -114,8 +99,7 @@ def match_quota(model_name, quota_type, quotas):
 def _matches_filter(model_name):
     if not MODEL_FILTER:
         return True
-    name_lower = model_name.lower()
-    return any(p.lower() in name_lower for p in MODEL_FILTER)
+    return any(p.lower() in model_name.lower() for p in MODEL_FILTER)
 
 
 def _group_key(info):
@@ -124,18 +108,15 @@ def _group_key(info):
 
 def _display_name(key):
     model_name, quota_type = key
-    label = "Global" if quota_type == "global" else "Regional"
-    return f"{model_name} [{label}]"
+    return f"{model_name} [{'Global' if quota_type == 'global' else 'Regional'}]"
 
 
 def _alarm_suffix(key):
     model_name, quota_type = key
-    safe = model_name.replace(".", "-").replace(":", "-")
-    return f"{safe}--{quota_type}"
+    return f"{model_name.replace('.', '-').replace(':', '-')}--{quota_type}"
 
 
 def group_by_model(profiles):
-    """Group active profiles by (model_name, quota_type), applying MODEL_FILTER."""
     by_model = defaultdict(list)
     for pid, info in profiles.items():
         if info.get("status") == "ACTIVE" and _matches_filter(info["model_name"]):
@@ -144,12 +125,11 @@ def group_by_model(profiles):
 
 
 # ---------------------------------------------------------------------------
-# CloudWatch Alarms
+# CloudWatch Alarms (TPM + RPM)
 # ---------------------------------------------------------------------------
 
-def put_model_alarm(key, profile_entries, quota_value):
-    """Create/update a CloudWatch Alarm with threshold = quota * THRESHOLD_PERCENT%."""
-    alarm_name = f"{ALARM_PREFIX}{_alarm_suffix(key)}"
+def _put_alarm(prefix, metric_name, stat, key, profile_entries, quota_value, unit_label):
+    alarm_name = f"{prefix}{_alarm_suffix(key)}"
     display = _display_name(key)
     threshold = quota_value * THRESHOLD_PERCENT / 100
 
@@ -163,11 +143,11 @@ def put_model_alarm(key, profile_entries, quota_value):
             "MetricStat": {
                 "Metric": {
                     "Namespace": "AWS/Bedrock",
-                    "MetricName": "EstimatedTPMQuotaUsage",
+                    "MetricName": metric_name,
                     "Dimensions": [{"Name": "ModelId", "Value": pid}],
                 },
                 "Period": 60,
-                "Stat": "Maximum",
+                "Stat": stat,
             },
             "ReturnData": False,
         })
@@ -179,7 +159,7 @@ def put_model_alarm(key, profile_entries, quota_value):
         metrics.append({
             "Id": "total",
             "Expression": "+".join(metric_ids),
-            "Label": f"{display} Total TPM",
+            "Label": f"{display} Total {unit_label}",
             "ReturnData": True,
         })
 
@@ -187,8 +167,8 @@ def put_model_alarm(key, profile_entries, quota_value):
     cw.put_metric_alarm(
         AlarmName=alarm_name,
         AlarmDescription=(
-            f"Bedrock TPM monitor: {display} | "
-            f"quota: {quota_value:,.0f} TPM, threshold: {threshold:,.0f} TPM ({THRESHOLD_PERCENT}%) | "
+            f"Bedrock {unit_label} monitor: {display} | "
+            f"quota: {quota_value:,.0f}, threshold: {threshold:,.0f} ({THRESHOLD_PERCENT}%) | "
             f"profiles: {profile_names}"
         ),
         Metrics=metrics,
@@ -199,20 +179,20 @@ def put_model_alarm(key, profile_entries, quota_value):
         AlarmActions=[SNS_TOPIC_ARN],
         OKActions=[SNS_TOPIC_ARN],
         Tags=[
-            {"Key": "ManagedBy", "Value": "bedrock-tpm-alarm-lambda"},
+            {"Key": "ManagedBy", "Value": "bedrock-quota-alarm-lambda"},
             {"Key": "ModelName", "Value": key[0]},
-            {"Key": "QuotaTPM", "Value": str(int(quota_value))},
+            {"Key": f"Quota{unit_label}", "Value": str(int(quota_value))},
         ],
     )
     return alarm_name
 
 
-def cleanup_stale_alarms(active_alarm_names):
+def cleanup_stale_alarms(prefix, active_names):
     paginator = cw.get_paginator("describe_alarms")
     stale = []
-    for page in paginator.paginate(AlarmNamePrefix=ALARM_PREFIX):
+    for page in paginator.paginate(AlarmNamePrefix=prefix):
         for a in page["MetricAlarms"]:
-            if a["AlarmName"] not in active_alarm_names:
+            if a["AlarmName"] not in active_names:
                 stale.append(a["AlarmName"])
     if stale:
         cw.delete_alarms(AlarmNames=stale)
@@ -224,20 +204,13 @@ def cleanup_stale_alarms(active_alarm_names):
 # ---------------------------------------------------------------------------
 
 def _short_model_name(model_name):
-    """Convert model ID to a human-readable short name.
-    e.g. 'anthropic.claude-sonnet-4-6' -> 'Claude Sonnet 4.6'
-         'anthropic.claude-opus-4-6-v1' -> 'Claude Opus 4.6'
-    """
     name = model_name.split(".")[-1] if "." in model_name else model_name
-    # Remove version suffixes
     name = re.sub(r"-\d{8}-v\d+:\d+$", "", name)
     name = re.sub(r"-v\d+(:\d+)?$", "", name)
-    # Convert to parts and rebuild with dots for version numbers
     parts = name.split("-")
     result = []
     i = 0
     while i < len(parts):
-        # Detect version pattern: two consecutive single digits
         if (i + 1 < len(parts) and parts[i].isdigit() and len(parts[i]) == 1
                 and parts[i + 1].isdigit() and len(parts[i + 1]) == 1):
             result.append(f"{parts[i]}.{parts[i+1]}")
@@ -248,28 +221,25 @@ def _short_model_name(model_name):
     return " ".join(result)
 
 
-def _build_metric_widget(key, profiles, quota, x, width, y):
-    """Build a single metric widget for a (model, quota_type) group."""
-    display = _display_name(key)
+def _build_metric_widget(metric_name, stat, unit_label, key, profiles, quota, x, width, y):
     quota_type = key[1]
     label = "Global" if quota_type == "global" else "Regional"
-
+    title = f"{label} {unit_label}"
     if quota:
+        title += f" (quota: {quota:,.0f})"
         raw_metrics = []
         expr_parts = []
-        hide_individual = len(profiles) >= 5
         for i, (pid, info) in enumerate(profiles):
             mid = f"raw{i}"
             expr_parts.append(mid)
             raw_metrics.append([
-                "AWS/Bedrock", "EstimatedTPMQuotaUsage", "ModelId", pid,
-                {"id": mid, "visible": False, "stat": "Maximum"},
+                "AWS/Bedrock", metric_name, "ModelId", pid,
+                {"id": mid, "visible": False, "stat": stat},
             ])
             raw_metrics.append([{
                 "expression": f"{mid}/{quota}*100",
                 "label": f"{info['profile_name']} (%)",
                 "id": f"pct{i}",
-                "visible": not hide_individual,
             }])
         raw_metrics.append([{
             "expression": f"({'+'.join(expr_parts)})/{quota}*100",
@@ -282,8 +252,7 @@ def _build_metric_widget(key, profiles, quota, x, width, y):
             "properties": {
                 "metrics": raw_metrics,
                 "view": "timeSeries", "region": REGION,
-                "title": f"{label} (quota: {quota:,.0f} TPM)",
-                "period": 60,
+                "title": title, "period": 60,
                 "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
                 "annotations": {"horizontal": [
                     {"label": f"Threshold ({THRESHOLD_PERCENT}%)",
@@ -292,43 +261,40 @@ def _build_metric_widget(key, profiles, quota, x, width, y):
             },
         }
     else:
+        title += " (quota: unknown)"
         raw_metrics = [[
-            "AWS/Bedrock", "EstimatedTPMQuotaUsage", "ModelId", pid,
-            {"label": info["profile_name"], "stat": "Maximum"},
+            "AWS/Bedrock", metric_name, "ModelId", pid,
+            {"label": info["profile_name"], "stat": stat},
         ] for pid, info in profiles]
         return {
             "type": "metric", "x": x, "y": y, "width": width, "height": 6,
             "properties": {
                 "metrics": raw_metrics,
                 "view": "timeSeries", "region": REGION,
-                "title": f"{label} (quota: unknown)",
-                "period": 60,
-                "yAxis": {"left": {"min": 0}},
+                "title": title, "period": 60,
             },
         }
 
 
-def build_dashboard(by_model, model_quotas):
-    """Create/update dashboard. Regional and Global graphs are placed side by side."""
+def build_dashboard(by_model, tpm_quotas, rpm_quotas):
+    """Build dashboard: per model, TPM row + RPM row, Regional left / Global right."""
     widgets = []
     y = 0
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    filter_text = f"Filter: `{', '.join(MODEL_FILTER)}`" if MODEL_FILTER else "Filter: all models"
-    header_md = (
-        f"# Bedrock TPM Quota Usage\n"
-        f"Alarm threshold: **{THRESHOLD_PERCENT}%** | "
-        f"Models: **{len(by_model)}** groups | "
-        f"{filter_text} | "
-        f"Last updated: {now}"
-    )
+    filter_text = f"`{', '.join(MODEL_FILTER)}`" if MODEL_FILTER else "all models"
     widgets.append({
         "type": "text", "x": 0, "y": y, "width": 24, "height": 2,
-        "properties": {"markdown": header_md},
+        "properties": {"markdown": (
+            f"# Bedrock Quota Usage (TPM & RPM)\n"
+            f"Alarm threshold: **{THRESHOLD_PERCENT}%** | "
+            f"Models: **{len(set(k[0] for k in by_model))}** | "
+            f"Filter: {filter_text} | "
+            f"Updated: {now}"
+        )},
     })
     y += 2
 
-    # Group by model name, then lay out Regional (left) and Global (right)
     models = defaultdict(dict)
     for key, profiles in by_model.items():
         model_name, quota_type = key
@@ -343,21 +309,31 @@ def build_dashboard(by_model, model_quotas):
         y += 1
 
         types = models[model_name]
-        if len(types) == 2:
-            # Side by side: Regional (left 12), Global (right 12)
-            for qt, x in [("regional", 0), ("global", 12)]:
-                if qt in types:
-                    key, profiles = types[qt]
-                    quota = model_quotas.get(key)
-                    widgets.append(_build_metric_widget(key, profiles, quota, x, 12, y))
-            y += 6
-        else:
-            # Single type: full width
-            for qt in types:
-                key, profiles = types[qt]
-                quota = model_quotas.get(key)
-                widgets.append(_build_metric_widget(key, profiles, quota, 0, 24, y))
-                y += 6
+        has_both = len(types) == 2
+
+        # TPM row
+        for qt, x in ([("regional", 0), ("global", 12)] if has_both else [(list(types.keys())[0], 0)]):
+            if qt not in types:
+                continue
+            key, profiles = types[qt]
+            w = 12 if has_both else 24
+            widgets.append(_build_metric_widget(
+                "EstimatedTPMQuotaUsage", "Maximum", "TPM",
+                key, profiles, tpm_quotas.get(key), x, w, y,
+            ))
+        y += 6
+
+        # RPM row
+        for qt, x in ([("regional", 0), ("global", 12)] if has_both else [(list(types.keys())[0], 0)]):
+            if qt not in types:
+                continue
+            key, profiles = types[qt]
+            w = 12 if has_both else 24
+            widgets.append(_build_metric_widget(
+                "Invocations", "Sum", "RPM",
+                key, profiles, rpm_quotas.get(key), x, w, y,
+            ))
+        y += 6
 
     cw.put_dashboard(
         DashboardName=DASHBOARD_NAME,
@@ -373,44 +349,52 @@ def handler(event, context):
     profiles = get_inference_profiles()
     print(f"Found {len(profiles)} inference profiles")
 
-    quotas = get_tpm_quotas()
-    print(f"Found {len(quotas)} TPM quotas")
+    tpm_quotas_raw, rpm_quotas_raw = get_quotas()
+    print(f"Found {len(tpm_quotas_raw)} TPM quotas, {len(rpm_quotas_raw)} RPM quotas")
 
     by_model = group_by_model(profiles)
     print(f"Grouped into {len(by_model)} groups")
 
-    model_quotas = {}
+    tpm_quotas, rpm_quotas = {}, {}
     for key in by_model:
         model_name, quota_type = key
-        val = match_quota(model_name, quota_type, quotas)
-        if val:
-            model_quotas[key] = val
-    print(f"Matched quotas for {len(model_quotas)}/{len(by_model)} groups")
+        tpm_val = match_quota(model_name, quota_type, tpm_quotas_raw)
+        rpm_val = match_quota(model_name, quota_type, rpm_quotas_raw)
+        if tpm_val:
+            tpm_quotas[key] = tpm_val
+        if rpm_val:
+            rpm_quotas[key] = rpm_val
+    print(f"Matched TPM: {len(tpm_quotas)}, RPM: {len(rpm_quotas)} / {len(by_model)} groups")
 
-    created = []
-    skipped = []
+    created_tpm, created_rpm, skipped = [], [], []
     for key, entries in by_model.items():
-        quota = model_quotas.get(key)
-        if quota:
-            name = put_model_alarm(key, entries, quota)
-            created.append(name)
-            print(f"Upserted: {name} (quota={quota:,.0f}, threshold={quota*THRESHOLD_PERCENT/100:,.0f})")
-        else:
+        tpm_q = tpm_quotas.get(key)
+        rpm_q = rpm_quotas.get(key)
+        if tpm_q:
+            created_tpm.append(_put_alarm(
+                ALARM_PREFIX_TPM, "EstimatedTPMQuotaUsage", "Maximum",
+                key, entries, tpm_q, "TPM",
+            ))
+        if rpm_q:
+            created_rpm.append(_put_alarm(
+                ALARM_PREFIX_RPM, "Invocations", "Sum",
+                key, entries, rpm_q, "RPM",
+            ))
+        if not tpm_q and not rpm_q:
             skipped.append(_display_name(key))
-            print(f"Skipped: {_display_name(key)}")
 
-    deleted = cleanup_stale_alarms(set(created))
-    if deleted:
-        print(f"Deleted stale alarms: {deleted}")
+    del_tpm = cleanup_stale_alarms(ALARM_PREFIX_TPM, set(created_tpm))
+    del_rpm = cleanup_stale_alarms(ALARM_PREFIX_RPM, set(created_rpm))
 
-    build_dashboard(by_model, model_quotas)
+    build_dashboard(by_model, tpm_quotas, rpm_quotas)
     print(f"Updated dashboard: {DASHBOARD_NAME}")
 
     return {
-        "upserted_alarms": len(created),
-        "deleted_alarms": len(deleted),
-        "skipped_no_quota": skipped,
+        "tpm_alarms": len(created_tpm),
+        "rpm_alarms": len(created_rpm),
+        "deleted_tpm": len(del_tpm),
+        "deleted_rpm": len(del_rpm),
+        "skipped": skipped,
         "dashboard": DASHBOARD_NAME,
-        "groups_with_quota": len(model_quotas),
-        "groups_total": len(by_model),
+        "groups": len(by_model),
     }
