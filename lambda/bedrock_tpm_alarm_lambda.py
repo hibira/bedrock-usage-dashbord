@@ -9,6 +9,7 @@ import json
 import os
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import boto3
 
@@ -256,6 +257,7 @@ def _build_metric_widget(key, profiles, quota, x, width, y):
     if quota:
         raw_metrics = []
         expr_parts = []
+        hide_individual = len(profiles) >= 5
         for i, (pid, info) in enumerate(profiles):
             mid = f"raw{i}"
             expr_parts.append(mid)
@@ -267,6 +269,7 @@ def _build_metric_widget(key, profiles, quota, x, width, y):
                 "expression": f"{mid}/{quota}*100",
                 "label": f"{info['profile_name']} (%)",
                 "id": f"pct{i}",
+                "visible": not hide_individual,
             }])
         raw_metrics.append([{
             "expression": f"({'+'.join(expr_parts)})/{quota}*100",
@@ -284,7 +287,7 @@ def _build_metric_widget(key, profiles, quota, x, width, y):
                 "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
                 "annotations": {"horizontal": [
                     {"label": f"Threshold ({THRESHOLD_PERCENT}%)",
-                     "value": THRESHOLD_PERCENT, "color": "#d62728"},
+                     "value": THRESHOLD_PERCENT, "color": "#ff7f0e"},
                 ]},
             },
         }
@@ -300,6 +303,7 @@ def _build_metric_widget(key, profiles, quota, x, width, y):
                 "view": "timeSeries", "region": REGION,
                 "title": f"{label} (quota: unknown)",
                 "period": 60,
+                "yAxis": {"left": {"min": 0}},
             },
         }
 
@@ -309,13 +313,20 @@ def build_dashboard(by_model, model_quotas):
     widgets = []
     y = 0
 
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    filter_text = f"Filter: `{', '.join(MODEL_FILTER)}`" if MODEL_FILTER else "Filter: all models"
+    header_md = (
+        f"# Bedrock TPM Quota Usage\n"
+        f"Alarm threshold: **{THRESHOLD_PERCENT}%** | "
+        f"Models: **{len(by_model)}** groups | "
+        f"{filter_text} | "
+        f"Last updated: {now}"
+    )
     widgets.append({
-        "type": "text", "x": 0, "y": y, "width": 24, "height": 1,
-        "properties": {
-            "markdown": f"# Bedrock TPM Quota Usage (alarm threshold: {THRESHOLD_PERCENT}%)"
-        },
+        "type": "text", "x": 0, "y": y, "width": 24, "height": 2,
+        "properties": {"markdown": header_md},
     })
-    y += 1
+    y += 2
 
     # Group by model name, then lay out Regional (left) and Global (right)
     models = defaultdict(dict)
@@ -327,7 +338,7 @@ def build_dashboard(by_model, model_quotas):
         short = _short_model_name(model_name)
         widgets.append({
             "type": "text", "x": 0, "y": y, "width": 24, "height": 1,
-            "properties": {"markdown": f"## {short}"},
+            "properties": {"markdown": f"---\n## {short}"},
         })
         y += 1
 
