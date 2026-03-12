@@ -222,8 +222,90 @@ def cleanup_stale_alarms(active_alarm_names):
 # CloudWatch Dashboard
 # ---------------------------------------------------------------------------
 
+def _short_model_name(model_name):
+    """Convert model ID to a human-readable short name.
+    e.g. 'anthropic.claude-sonnet-4-6' -> 'Claude Sonnet 4.6'
+         'anthropic.claude-opus-4-6-v1' -> 'Claude Opus 4.6'
+    """
+    name = model_name.split(".")[-1] if "." in model_name else model_name
+    # Remove version suffixes
+    name = re.sub(r"-\d{8}-v\d+:\d+$", "", name)
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)
+    # Convert to parts and rebuild with dots for version numbers
+    parts = name.split("-")
+    result = []
+    i = 0
+    while i < len(parts):
+        # Detect version pattern: two consecutive single digits
+        if (i + 1 < len(parts) and parts[i].isdigit() and len(parts[i]) == 1
+                and parts[i + 1].isdigit() and len(parts[i + 1]) == 1):
+            result.append(f"{parts[i]}.{parts[i+1]}")
+            i += 2
+        else:
+            result.append(parts[i].title())
+            i += 1
+    return " ".join(result)
+
+
+def _build_metric_widget(key, profiles, quota, x, width, y):
+    """Build a single metric widget for a (model, quota_type) group."""
+    display = _display_name(key)
+    quota_type = key[1]
+    label = "Global" if quota_type == "global" else "Regional"
+
+    if quota:
+        raw_metrics = []
+        expr_parts = []
+        for i, (pid, info) in enumerate(profiles):
+            mid = f"raw{i}"
+            expr_parts.append(mid)
+            raw_metrics.append([
+                "AWS/Bedrock", "EstimatedTPMQuotaUsage", "ModelId", pid,
+                {"id": mid, "visible": False, "stat": "Maximum"},
+            ])
+            raw_metrics.append([{
+                "expression": f"{mid}/{quota}*100",
+                "label": f"{info['profile_name']} (%)",
+                "id": f"pct{i}",
+            }])
+        raw_metrics.append([{
+            "expression": f"({'+'.join(expr_parts)})/{quota}*100",
+            "label": "Total (%)",
+            "id": "total_pct",
+            "color": "#d62728",
+        }])
+        return {
+            "type": "metric", "x": x, "y": y, "width": width, "height": 6,
+            "properties": {
+                "metrics": raw_metrics,
+                "view": "timeSeries", "region": REGION,
+                "title": f"{label} (quota: {quota:,.0f} TPM)",
+                "period": 60,
+                "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
+                "annotations": {"horizontal": [
+                    {"label": f"Threshold ({THRESHOLD_PERCENT}%)",
+                     "value": THRESHOLD_PERCENT, "color": "#d62728"},
+                ]},
+            },
+        }
+    else:
+        raw_metrics = [[
+            "AWS/Bedrock", "EstimatedTPMQuotaUsage", "ModelId", pid,
+            {"label": info["profile_name"], "stat": "Maximum"},
+        ] for pid, info in profiles]
+        return {
+            "type": "metric", "x": x, "y": y, "width": width, "height": 6,
+            "properties": {
+                "metrics": raw_metrics,
+                "view": "timeSeries", "region": REGION,
+                "title": f"{label} (quota: unknown)",
+                "period": 60,
+            },
+        }
+
+
 def build_dashboard(by_model, model_quotas):
-    """Create/update dashboard. Each (model, quota_type) group gets its own graph."""
+    """Create/update dashboard. Regional and Global graphs are placed side by side."""
     widgets = []
     y = 0
 
@@ -235,67 +317,36 @@ def build_dashboard(by_model, model_quotas):
     })
     y += 1
 
-    for key, profiles in sorted(by_model.items(), key=lambda x: _display_name(x[0])):
-        display = _display_name(key)
-        quota = model_quotas.get(key)
-        quota_label = f" (quota: {quota:,.0f} TPM)" if quota else " (quota: unknown)"
+    # Group by model name, then lay out Regional (left) and Global (right)
+    models = defaultdict(dict)
+    for key, profiles in by_model.items():
+        model_name, quota_type = key
+        models[model_name][quota_type] = (key, profiles)
 
+    for model_name in sorted(models.keys()):
+        short = _short_model_name(model_name)
         widgets.append({
             "type": "text", "x": 0, "y": y, "width": 24, "height": 1,
-            "properties": {"markdown": f"## {display}{quota_label}"},
+            "properties": {"markdown": f"## {short}"},
         })
         y += 1
 
-        if quota:
-            raw_metrics = []
-            expr_parts = []
-            for i, (pid, info) in enumerate(profiles):
-                mid = f"raw{i}"
-                expr_parts.append(mid)
-                raw_metrics.append([
-                    "AWS/Bedrock", "EstimatedTPMQuotaUsage", "ModelId", pid,
-                    {"id": mid, "visible": False, "stat": "Maximum"},
-                ])
-                raw_metrics.append([{
-                    "expression": f"{mid}/{quota}*100",
-                    "label": f"{info['profile_name']} (%)",
-                    "id": f"pct{i}",
-                }])
-            raw_metrics.append([{
-                "expression": f"({'+'.join(expr_parts)})/{quota}*100",
-                "label": "Total (%)",
-                "id": "total_pct",
-                "color": "#d62728",
-            }])
-            widgets.append({
-                "type": "metric", "x": 0, "y": y, "width": 24, "height": 6,
-                "properties": {
-                    "metrics": raw_metrics,
-                    "view": "timeSeries", "region": REGION,
-                    "title": f"{display} - TPM Quota Usage (%)",
-                    "period": 60,
-                    "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
-                    "annotations": {"horizontal": [
-                        {"label": f"Threshold ({THRESHOLD_PERCENT}%)",
-                         "value": THRESHOLD_PERCENT, "color": "#d62728"},
-                    ]},
-                },
-            })
+        types = models[model_name]
+        if len(types) == 2:
+            # Side by side: Regional (left 12), Global (right 12)
+            for qt, x in [("regional", 0), ("global", 12)]:
+                if qt in types:
+                    key, profiles = types[qt]
+                    quota = model_quotas.get(key)
+                    widgets.append(_build_metric_widget(key, profiles, quota, x, 12, y))
+            y += 6
         else:
-            raw_metrics = [[
-                "AWS/Bedrock", "EstimatedTPMQuotaUsage", "ModelId", pid,
-                {"label": info["profile_name"], "stat": "Maximum"},
-            ] for pid, info in profiles]
-            widgets.append({
-                "type": "metric", "x": 0, "y": y, "width": 24, "height": 6,
-                "properties": {
-                    "metrics": raw_metrics,
-                    "view": "timeSeries", "region": REGION,
-                    "title": f"{display} - TPM (raw, quota unknown)",
-                    "period": 60,
-                },
-            })
-        y += 6
+            # Single type: full width
+            for qt in types:
+                key, profiles = types[qt]
+                quota = model_quotas.get(key)
+                widgets.append(_build_metric_widget(key, profiles, quota, 0, 24, y))
+                y += 6
 
     cw.put_dashboard(
         DashboardName=DASHBOARD_NAME,
