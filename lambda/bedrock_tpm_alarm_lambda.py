@@ -321,7 +321,7 @@ def build_dashboard(by_model, tpm_quotas, rpm_quotas):
             key, profiles = types[qt]
             w = 12 if has_both else 24
             widgets.append(_build_metric_widget(
-                "EstimatedTPMQuotaUsage", "Maximum", "TPM",
+                "EstimatedTPMQuotaUsage", "Sum", "TPM",
                 key, profiles, tpm_quotas.get(key), x, w, y,
             ))
         y += 6
@@ -375,7 +375,7 @@ def handler(event, context):
         rpm_q = rpm_quotas.get(key)
         if tpm_q:
             created_tpm.append(_put_alarm(
-                ALARM_PREFIX_TPM, "EstimatedTPMQuotaUsage", "Maximum",
+                ALARM_PREFIX_TPM, "EstimatedTPMQuotaUsage", "Sum",
                 key, entries, tpm_q, "TPM",
             ))
         if rpm_q:
