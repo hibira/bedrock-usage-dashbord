@@ -2,17 +2,32 @@
 
 Automatically creates and updates CloudWatch Alarms and a Dashboard for Bedrock inference profile `EstimatedTPMQuotaUsage` metrics.
 
-Alarm thresholds are derived from actual Service Quotas (TPM limits per model), and the dashboard displays usage as a percentage of quota.
+`EstimatedTPMQuotaUsage` represents the estimated quota consumption per minute (not a percentage), calculated as:
+
+```
+InputTokenCount + CacheWriteInputTokens + (OutputTokenCount × burndown rate)
+```
+
+The burndown rate is 5× for Claude 3.7+ models (1× for others). Alarm thresholds are derived from actual Service Quotas (TPM limits per model).
 
 ## Features
 
 - Fetches both SYSTEM_DEFINED and APPLICATION inference profiles
-- Groups profiles by underlying model and sums TPM usage per model
+- Groups profiles by (model, quota type) — Global and Regional quotas are monitored separately
 - Creates CloudWatch Alarms with thresholds based on actual Service Quotas
 - Builds a CloudWatch Dashboard showing usage as % of quota via metric math
 - Cleans up stale alarms for removed profiles/models
 - Supports filtering to monitor only specific models
 - Runs daily at 0:00 UTC (9:00 JST) via EventBridge
+
+## Quota Grouping
+
+| Quota Type | Profiles | Quota Source |
+|---|---|---|
+| Regional | `us.*`, `eu.*`, `ap.*` + application profiles (regional model ARN) | `Cross-region model inference tokens per minute` |
+| Global | `global.*` + application profiles (regionless model ARN) | `Global cross-region model inference tokens per minute` |
+
+> **Note:** 1M Context Length quotas exist separately in Service Quotas but cannot be monitored per-profile, as the same profile serves both standard and 1M requests depending on input size.
 
 ## Deploy
 
@@ -50,10 +65,10 @@ npx cdk deploy -c sns_topic_arn=arn:aws:sns:us-east-1:123456789012:your-topic
 ## How It Works
 
 1. Fetches all inference profiles (system-defined + application)
-2. Groups profiles by underlying model name
+2. Groups profiles by (model name, quota type: global/regional)
 3. Fetches TPM quotas from Service Quotas API
-4. For each model, creates a CloudWatch Alarm where:
+4. For each group, creates a CloudWatch Alarm where:
    - Threshold = `quota_tpm × THRESHOLD_PERCENT / 100`
-   - Multiple profiles for the same model are summed via metric math
-5. Builds a dashboard with per-model graphs showing usage as % of quota
-6. Deletes alarms for models no longer in scope
+   - Multiple profiles for the same group are summed via metric math
+5. Builds a dashboard with per-group graphs showing usage as % of quota
+6. Deletes alarms for groups no longer in scope
