@@ -39,11 +39,21 @@ def get_inference_profiles():
                 pid = p["inferenceProfileId"]
                 model_arn = p.get("models", [{}])[0].get("modelArn", "unknown")
                 model_name = model_arn.rsplit("/", 1)[-1] if "/" in model_arn else model_arn
-                # global.* -> separate global quota; everything else -> regional quota
-                quota_type = "global" if pid.startswith("global.") else "regional"
+                name = p.get("inferenceProfileName", "")
+                # Determine quota scope
+                is_global = pid.startswith("global.")
+                is_1m = "1m" in pid.lower() or "1M" in name or "1m" in model_name.lower()
+                if is_global and is_1m:
+                    quota_type = "global-1m"
+                elif is_global:
+                    quota_type = "global"
+                elif is_1m:
+                    quota_type = "regional-1m"
+                else:
+                    quota_type = "regional"
                 profiles[pid] = {
                     "model_name": model_name,
-                    "profile_name": p.get("inferenceProfileName", pid),
+                    "profile_name": name or pid,
                     "status": p.get("status"),
                     "quota_type": quota_type,
                 }
@@ -78,20 +88,23 @@ def _normalize(s):
 
 def match_quota(model_name, quota_type, quotas):
     """Find the best matching TPM quota for a model + quota_type.
-    quota_type: 'global' -> 'global cross-region', 'regional' -> 'cross-region'
+    quota_type: global/global-1m/regional/regional-1m
     """
     model_keywords = _normalize(model_name.replace(".", " ").replace("-", " "))
-    prefix = "global cross-region" if quota_type == "global" else "cross-region"
+    is_1m = quota_type.endswith("-1m")
+    is_global = quota_type.startswith("global")
+    prefix = "global cross-region" if is_global else "cross-region"
 
     best_match = None
     best_score = 0
     for qname_lower, qinfo in quotas.items():
         if prefix not in qname_lower:
             continue
-        # For regional, exclude global entries
-        if quota_type == "regional" and "global" in qname_lower:
+        if not is_global and "global" in qname_lower:
             continue
-        if "1m context" in qname_lower:
+        # 1M context matching
+        has_1m = "1m context" in qname_lower
+        if is_1m != has_1m:
             continue
 
         q_normalized = _normalize(qinfo["name"])
@@ -120,8 +133,13 @@ def _group_key(info):
 
 def _display_name(key):
     model_name, quota_type = key
-    label = "Global" if quota_type == "global" else "Regional"
-    return f"{model_name} [{label}]"
+    labels = {
+        "global": "Global",
+        "global-1m": "Global 1M",
+        "regional": "Regional",
+        "regional-1m": "Regional 1M",
+    }
+    return f"{model_name} [{labels.get(quota_type, quota_type)}]"
 
 
 def _alarm_suffix(key):
