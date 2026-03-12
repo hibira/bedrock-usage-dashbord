@@ -23,28 +23,36 @@ cw = boto3.client("cloudwatch", region_name=REGION)
 sq = boto3.client("service-quotas", region_name=REGION)
 
 
+def _resolve_profile_type(profile):
+    """Determine quota type (on-demand/cross-region/global) from profile metadata."""
+    pid = profile["inferenceProfileId"]
+    ptype = profile.get("type", "SYSTEM")
+    if ptype == "APPLICATION":
+        return "on-demand"
+    if pid.startswith("global."):
+        return "global"
+    if any(pid.startswith(f"{r}.") for r in ("us", "eu", "ap")):
+        return "cross-region"
+    return "on-demand"
+
+
 def get_inference_profiles():
-    """Fetch all inference profiles and return a mapping of profile ID to info."""
+    """Fetch both SYSTEM and APPLICATION inference profiles."""
     profiles = {}
     paginator = bedrock.get_paginator("list_inference_profiles")
-    for page in paginator.paginate():
-        for p in page["inferenceProfileSummaries"]:
-            pid = p["inferenceProfileId"]
-            model_arn = p.get("models", [{}])[0].get("modelArn", "unknown")
-            model_name = model_arn.rsplit("/", 1)[-1] if "/" in model_arn else model_arn
-            # Determine profile type from ID prefix
-            if pid.startswith("global."):
-                profile_type = "global"
-            elif pid.startswith("us.") or pid.startswith("eu.") or pid.startswith("ap."):
-                profile_type = "cross-region"
-            else:
-                profile_type = "on-demand"
-            profiles[pid] = {
-                "model_name": model_name,
-                "profile_name": p.get("inferenceProfileName", pid),
-                "status": p.get("status"),
-                "profile_type": profile_type,
-            }
+    for profile_type in ("SYSTEM_DEFINED", "APPLICATION"):
+        for page in paginator.paginate(typeEquals=profile_type):
+            for p in page["inferenceProfileSummaries"]:
+                pid = p["inferenceProfileId"]
+                model_arn = p.get("models", [{}])[0].get("modelArn", "unknown")
+                model_name = model_arn.rsplit("/", 1)[-1] if "/" in model_arn else model_arn
+                profiles[pid] = {
+                    "model_name": model_name,
+                    "profile_name": p.get("inferenceProfileName", pid),
+                    "status": p.get("status"),
+                    "profile_type": _resolve_profile_type(p),
+                    "type": p.get("type", "SYSTEM"),
+                }
     return profiles
 
 
