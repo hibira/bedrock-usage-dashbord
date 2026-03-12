@@ -1,6 +1,6 @@
 """
-Bedrock 推論プロファイルの EstimatedTPMQuotaUsage を監視する
-CloudWatch Alarm + Dashboard を日次で自動作成/更新する Lambda 関数。
+Auto-create/update CloudWatch Alarms and Dashboard for Bedrock inference profile
+EstimatedTPMQuotaUsage metrics. Runs daily via EventBridge.
 """
 
 import json
@@ -20,7 +20,7 @@ cw = boto3.client("cloudwatch", region_name=REGION)
 
 
 def get_inference_profiles():
-    """推論プロファイル一覧を取得し、ID→情報のマッピングを返す。"""
+    """Fetch all inference profiles and return a mapping of profile ID to info."""
     profiles = {}
     paginator = bedrock.get_paginator("list_inference_profiles")
     for page in paginator.paginate():
@@ -37,11 +37,12 @@ def get_inference_profiles():
 
 
 def put_alarm(profile_id, info):
+    """Create or update a CloudWatch Alarm for the given inference profile."""
     alarm_name = f"{ALARM_PREFIX}{profile_id}"
     cw.put_metric_alarm(
         AlarmName=alarm_name,
         AlarmDescription=(
-            f"Bedrock TPM 監視: {info['profile_name']} "
+            f"Bedrock TPM monitor: {info['profile_name']} "
             f"(model: {info['model_name']}, profile: {profile_id})"
         ),
         Namespace="AWS/Bedrock",
@@ -64,6 +65,7 @@ def put_alarm(profile_id, info):
 
 
 def cleanup_stale_alarms(active_profile_ids):
+    """Delete alarms for inference profiles that no longer exist."""
     paginator = cw.get_paginator("describe_alarms")
     stale = []
     for page in paginator.paginate(AlarmNamePrefix=ALARM_PREFIX):
@@ -77,8 +79,7 @@ def cleanup_stale_alarms(active_profile_ids):
 
 
 def build_dashboard(active_profiles):
-    """モデルごとにグループ化した CloudWatch Dashboard を作成/更新する。"""
-    # モデル名でグループ化
+    """Create/update a CloudWatch Dashboard grouped by model name."""
     by_model = defaultdict(list)
     for pid, info in active_profiles.items():
         by_model[info["model_name"]].append((pid, info))
@@ -86,7 +87,6 @@ def build_dashboard(active_profiles):
     widgets = []
     y = 0
 
-    # タイトル
     widgets.append({
         "type": "text",
         "x": 0, "y": y, "width": 24, "height": 1,
@@ -97,7 +97,6 @@ def build_dashboard(active_profiles):
     y += 1
 
     for model_name, profiles in sorted(by_model.items()):
-        # モデル名ヘッダー
         widgets.append({
             "type": "text",
             "x": 0, "y": y, "width": 24, "height": 1,
@@ -105,7 +104,6 @@ def build_dashboard(active_profiles):
         })
         y += 1
 
-        # 該当モデルの全プロファイルを1つのグラフにまとめる
         metrics = []
         for pid, info in profiles:
             metrics.append([

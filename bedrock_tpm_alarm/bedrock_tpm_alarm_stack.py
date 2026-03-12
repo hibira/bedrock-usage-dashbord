@@ -1,8 +1,8 @@
 """
 CDK Stack: Bedrock TPM Alarm Manager
-- Lambda 関数（日次で推論プロファイルの CloudWatch Alarm を自動管理）
-- EventBridge スケジュール（毎日 AM 9:00 JST = 0:00 UTC）
-- 既存 SNS トピックを利用
+- Lambda function to auto-manage CloudWatch Alarms and Dashboard for inference profiles
+- EventBridge schedule for daily execution (0:00 UTC)
+- Uses an existing SNS topic for alarm notifications
 """
 
 from aws_cdk import (
@@ -15,6 +15,7 @@ from aws_cdk import (
     aws_sns as sns,
 )
 from constructs import Construct
+
 
 class BedrockTpmAlarmStack(Stack):
     def __init__(self, scope: Construct, id: str, *, sns_topic_arn: str, **kwargs):
@@ -51,7 +52,7 @@ class BedrockTpmAlarmStack(Stack):
         ))
         topic.grant_publish(fn)
 
-        # 毎日 0:00 UTC (= 9:00 JST)
+        # Daily at 0:00 UTC
         events.Rule(
             self, "DailySchedule",
             schedule=events.Schedule.cron(minute="0", hour="0"),
